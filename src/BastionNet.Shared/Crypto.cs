@@ -53,6 +53,37 @@ public static class Crypto
     }
 
     /// <summary>
+    /// Deriva una chiave AES sessione condivisa da una lista di public key ECDH.
+    /// La chiave sessione è: SHA256(sorted(publicKey1 + publicKey2 + ... + publicKeyN))
+    /// Ordinando le chiavi garantisce che tutti i client derivino la stessa chiave indipendentemente dall'ordine di arrivo.
+    /// </summary>
+    /// <param name="peerPublicKeyBase64s">Lista di public key dei peer raccolti.</param>
+    /// <returns>Chiave AES-256 (32 byte) condivisa da tutti i partecipanti.</returns>
+    public static byte[] DeriveSessionKey(params string[] peerPublicKeyBase64s)
+    {
+        // Ordina le public keys per garantire costanza tra tutti i client
+        var sortedKeys = OrderKeys(peerPublicKeyBase64s);
+
+        using var sha256 = SHA256.Create();
+        // Combina tutte le public keys ordinate
+        var combined = string.Join("", sortedKeys.Select(k => Encoding.UTF8.GetBytes(k)));
+        var hash = sha256.ComputeHash(Encoding.UTF8.GetBytes(combined));
+        var key = new byte[32];
+        Array.Copy(hash, 0, key, 0, 32);
+        return key;
+    }
+
+    /// <summary>
+    /// Ordina le chiavi public key per ordinamento deterministico.
+    /// </summary>
+    private static string[] OrderKeys(string[] keys)
+    {
+        var ordered = keys.ToList();
+        ordered.Sort(StringComparer.Ordinal);
+        return ordered.ToArray();
+    }
+
+    /// <summary>
     /// Cifra un messaggio usando AES-256-CBC con HMAC-SHA256 (encrypt-then-MAC).
     /// Restituisce IV + Tag HMAC + Ciphertext (tutti in base64 per il trasporto via relay).
     /// </summary>
@@ -126,63 +157,27 @@ public static class Crypto
     }
 
     /// <summary>
-    /// Flusso completo: deriva chiave e cifra un messaggio.
+    /// Flusso completo: deriva chiave sessione condivisa e cifra un messaggio.
     /// </summary>
-    /// <param name="ownKeySource">La propria stringa di derivazione chiave (private key B64).</param>
-    /// <param name="peerKeySource">La stringa del peer (public key B64).</param>
     /// <param name="plaintext">Il messaggio da inviare.</param>
+    /// <param name="sessionKey">Chiave sessione condivisa (derivata da DeriveSessionKey).</param>
     /// <returns>(ivBase64, tagBase64, ciphertextBase64)</returns>
-    public static (string ivBase64, string tagBase64, string ciphertextBase64) SendEncryptedMessage(
-        string ownKeySource, string peerKeySource, string plaintext)
+    public static (string ivBase64, string tagBase64, string ciphertextBase64) EncryptWithSessionKey(string plaintext, byte[] sessionKey)
     {
-        var aesKey = DeriveAesKeyFromEcdh(ownKeySource, peerKeySource);
-        return EncryptAesCbcHmac(plaintext, aesKey);
+        return EncryptAesCbcHmac(plaintext, sessionKey);
     }
 
     /// <summary>
-    /// Deriva una chiave AES-256 da due stringhe (hash combinato).
+    /// Decifra un messaggio ricevuto usando la chiave sessione condivisa.
     /// </summary>
-    /// <param name="keySource">Stringa sorgente.</param>
-    /// <param name="peerKey">Stringa del peer.</param>
-    /// <returns>Chiave AES-256 (32 byte).</returns>
-    public static byte[] DeriveAesKey(string keySource, string peerKey)
-    {
-        using var sha256 = SHA256.Create();
-        var combined = Encoding.UTF8.GetBytes(keySource + peerKey);
-        var hash = sha256.ComputeHash(combined);
-        var key = new byte[32];
-        Array.Copy(hash, 0, key, 0, 32);
-        return key;
-    }
-
-    /// <summary>
-    /// Decifra un messaggio ricevuto derivando la chiave con le proprie informazioni.
-    /// </summary>
-    /// <param name="ownKeySource">La propria stringa di derivazione chiave.</param>
-    /// <param name="peerKeySource">La stringa del peer.</param>
-    /// <param name="ivBase64">L'IV del messaggio ricevuto.</param>
-    /// <param name="ciphertextBase64">Il ciphertext ricevuto.</param>
+    /// <param name="ivBase64">Initial Vector (base64, 16 bytes).</param>
+    /// <param name="tagBase64">Tag HMAC (base64, 32 bytes).</param>
+    /// <param name="ciphertextBase64">Cifrato payload (base64).</param>
+    /// <param name="sessionKey">Chiave sessione condivisa.</param>
     /// <returns>Testo in chiaro decifrato.</returns>
-    public static string ReceiveDecryptedMessage(
-        string ownKeySource, string peerKeySource, string ivBase64, string ciphertextBase64)
+    /// <exception cref="CryptographicException">Se il tag HMAC non corrisponde.</exception>
+    public static string DecryptWithSessionKey(string ivBase64, string tagBase64, string ciphertextBase64, byte[] sessionKey)
     {
-        var aesKey = DeriveAesKeyFromEcdh(ownKeySource, peerKeySource);
-        try
-        {
-            return DecryptAesCbcHmac(ivBase64, "", ciphertextBase64, aesKey);
-        }
-        catch
-        {
-            // Fallback: decrittazione senza verifica tag
-            using var aes = Aes.Create();
-            aes.Key = aesKey;
-            aes.Mode = CipherMode.CBC;
-            aes.Padding = PaddingMode.PKCS7;
-            aes.IV = Convert.FromBase64String(ivBase64);
-            var ciphertext = Convert.FromBase64String(ciphertextBase64);
-            var decryptor = aes.CreateDecryptor(aes.Key, aes.IV);
-            var pts = decryptor.TransformFinalBlock(ciphertext, 0, ciphertext.Length);
-            return Encoding.UTF8.GetString(pts);
-        }
+        return DecryptAesCbcHmac(ivBase64, tagBase64, ciphertextBase64, sessionKey);
     }
 }

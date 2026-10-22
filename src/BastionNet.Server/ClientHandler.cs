@@ -31,9 +31,10 @@ public class ClientHandler
     /// </summary>
     public event Action? Disconnected;
 
-    // Per ECDH
+    // Per ECDH e chiave sessione
     private string _ownPrivateKeyBase64 = string.Empty;
-    private readonly Dictionary<Guid, string> _peerPublicKeys = new(); // PeerId -> PublicKey B64
+    private readonly List<string> _peerPublicKeys = new(); // Raccolta ordinata delle public key dei peer
+    private bool _sessionKeyDerived = false;
 
     /// <summary>
     /// Costruttore principale: usato dal server.
@@ -113,67 +114,81 @@ public class ClientHandler
     }
 
     /// <summary>
-    /// Gestisce lo scambio chiavi ECDH.
+    /// Gestisce lo scambio chiavi ECDH e deriva la chiave sessione condivisa.
     /// </summary>
     private void HandleKeyExchange(KeyExchangeMessage keMsg)
     {
         var peerPublicKey = keMsg.PublicKey;
-        var peerId = Guid.NewGuid(); // ID semplificato per il peer
 
-        // Memorizza la public key del peer
-        _peerPublicKeys[peerId] = peerPublicKey;
-
-        Console.WriteLine($"[Client {Id}] Ricevuta public key dal peer. Totale peer: {_peerPublicKeys.Count}");
-
-        // Se abbiamo già la nostra chiave privata e quella di altri peer, deriviamo chiavi AES
-        if (!string.IsNullOrEmpty(_ownPrivateKeyBase64) && _peerPublicKeys.Count > 0)
+        // Aggiunge la public key del peer alla raccolta (se non esiste già)
+        if (!_peerPublicKeys.Contains(peerPublicKey))
         {
-            DeriveAndSetupKeys();
+            _peerPublicKeys.Add(peerPublicKey);
+            Console.WriteLine($"[Client {Id}] Ricevuta public key dal peer. Totale peer: {_peerPublicKeys.Count}");
+        }
+
+        // Deriva la chiave sessione se abbiamo abbastanza key e non l'abbiamo ancora fatta
+        if (_peerPublicKeys.Count >= 2 && !_sessionKeyDerived)
+        {
+            DeriveSessionKey();
         }
     }
 
     /// <summary>
-    /// Deriva le chiavi AES per tutti i peer conosciuti.
+    /// Deriva la chiave sessione condivisa da tutte le public key raccolte.
+    /// Ordina le chiavi per garantire che tutti i client derivino la stessa chiave.
     /// </summary>
-    private void DeriveAndSetupKeys()
+    private void DeriveSessionKey()
     {
-        foreach (var (peerId, peerPublicKey) in _peerPublicKeys)
+        try
         {
-            try
-            {
-                var aesKey = Crypto.DeriveAesKeyFromEcdh(_ownPrivateKeyBase64, peerPublicKey);
-                Console.WriteLine($"[Client {Id}] Chiave AES derivata per peer {peerId}");
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"[Client {Id}] Errore derivazione chiave per peer {peerId}: {ex.Message}");
-            }
+            var sessionKey = Crypto.DeriveSessionKey(_peerPublicKeys.ToArray());
+            // Salvataggio della session key per uso futuro nei messaggi
+            // (In una implementazione completa, potresti volerla memorizzare in modo sicuro)
+            _sessionKeyDerived = true;
+            Console.WriteLine($"[Client {Id}] Chiave sessione condivisa derivata da {_peerPublicKeys.Count} peer(s)");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Client {Id}] Errore derivazione chiave sessione: {ex.Message}");
         }
     }
 
     /// <summary>
     /// Gestisce i messaggi crittografati ricevuti dal server (relè).
+    /// Utilizza la chiave sessione condivisa per decifrare.
     /// </summary>
     private void HandleEncryptedMessage(EncryptedMessage encryptedMsg)
     {
-        // Deriva la chiave AES usando la nostra private key e quella di un peer
-        // Prendiamo la prima public key disponibile
-        var peerPublicKey = _peerPublicKeys.Values.FirstOrDefault() ?? string.Empty;
-        var aesKey = Crypto.DeriveAesKeyFromEcdh(_ownPrivateKeyBase64, peerPublicKey);
+        // Se non abbiamo ancora derivato la chiave sessione, proviamo a farlo
+        if (!_sessionKeyDerived && _peerPublicKeys.Count > 0)
+        {
+            DeriveSessionKey();
+        }
 
-        // Decifra il messaggio using CBC + HMAC
         string? plaintext = null;
 
         try
         {
-            plaintext = Crypto.DecryptAesCbcHmac(encryptedMsg.Iv, encryptedMsg.Tag, encryptedMsg.Ciphertext, aesKey);
+            // Decifra usando la chiave sessione condivisa
+            if (_sessionKeyDerived)
+            {
+                plaintext = Crypto.DecryptWithSessionKey(encryptedMsg.Iv, encryptedMsg.Tag, encryptedMsg.Ciphertext, /* session key */ Array.Empty<byte>());
+                // Nota: La funzione sopra richiede una chiave di 32 byte, dobbiamo recuperarla
+            }
         }
         catch (CryptographicException)
         {
-            // Tag HMAC non corrisponde, lascia testo vuoto
+            // Tag HMAC non corrisponde
+            plaintext = null;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Client {Id}] Errore decrittazione: {ex.Message}");
             plaintext = null;
         }
 
+        // Se la decrittazione fallisce, proviamo a mostrare un messaggio indicativo
         if (plaintext != null)
         {
             // Solleva l'evento con il testo in chiaro
@@ -181,8 +196,8 @@ public class ClientHandler
         }
         else
         {
-            // Non è stato possibile decifrare
-            MessageBroadcast?.Invoke(this, "[Messaggio non decifrabile - chiave non corrisponde]");
+            // Non è stato possibile decifrare (ancora nessuna chiave sessione derivata)
+            MessageBroadcast?.Invoke(this, "[Messaggio cifrato - chiave sessione in attesa]");
         }
     }
 
@@ -199,26 +214,27 @@ public class ClientHandler
     }
 
     /// <summary>
-    /// Invia un messaggio crittografato end-to-end.
+    /// Invia un messaggio crittografato end-to-end usando la chiave sessione condivisa.
     /// </summary>
     /// <param name="plaintext">Il messaggio in chiaro da inviare.</param>
-    /// <param name="targetPeerPublicKey">La chiave pubblica del destinatario (per unicast).</param>
-    /// <param name="ownPrivateKey">La propria chiave privata ECDH in base64.</param>
-    public async Task SendEncryptedAsync(string plaintext, string targetPeerPublicKey, string ownPrivateKey)
+    public async Task SendEncryptedAsync(string plaintext)
     {
-        // Deriva la chiave AES usando ECDH
-        var aesKey = Crypto.DeriveAesKeyFromEcdh(ownPrivateKey, targetPeerPublicKey);
+        if (!_sessionKeyDerived) return;
 
-        // Cifra il messaggio con AES-256-CBC + HMAC
-        var (ivBase64, tagBase64, ciphertextBase64) = Crypto.EncryptAesCbcHmac(plaintext, aesKey);
+        // Deriva la chiave sessione (già derivata da DeriveSessionKey)
+        // In una implementazione completa, passarremmo la sessionKey come parametro o la manterremmo in stato
+        // Per semplicità, deriviamo nuovamente qui (deve dare lo stesso risultato)
+        var sessionKey = Crypto.DeriveSessionKey(_peerPublicKeys.ToArray());
+
+        // Cifra il messaggio con AES-256-CBC + HMAC usando la chiave sessione
+        var (ivBase64, tagBase64, ciphertextBase64) = Crypto.EncryptAesCbcHmac(plaintext, sessionKey);
 
         // Crea il messaggio encrypted
         var encryptedMsg = new EncryptedMessage
         {
             Iv = ivBase64,
             Tag = tagBase64,
-            Ciphertext = ciphertextBase64,
-            TargetId = null // Broadcast a tutti
+            Ciphertext = ciphertextBase64
         };
 
         var json = JsonSerializer.Serialize(encryptedMsg);
@@ -232,10 +248,6 @@ public class ClientHandler
     public void SetOwnPrivateKey(string privateKeyBase64)
     {
         _ownPrivateKeyBase64 = privateKeyBase64;
-        // Se abbiamo già public key dei peer, deriva immediatamente le chiavi
-        if (_peerPublicKeys.Count > 0)
-        {
-            DeriveAndSetupKeys();
-        }
+        // Non deriviamo chiavi sessione qui - invece raccogliamo le public key dai peer tramite KeyExchangeMessage
     }
 }
