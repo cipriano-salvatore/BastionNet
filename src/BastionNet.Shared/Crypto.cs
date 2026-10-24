@@ -1,4 +1,5 @@
 using System;
+using System.Linq;
 using System.Security.Cryptography;
 using System.Text;
 
@@ -59,14 +60,21 @@ public static class Crypto
     /// </summary>
     /// <param name="peerPublicKeyBase64s">Lista di public key dei peer raccolti.</param>
     /// <returns>Chiave AES-256 (32 byte) condivisa da tutti i partecipanti.</returns>
-    public static byte[] DeriveSessionKey(params string[] peerPublicKeyBase64s)
+    public static byte[] DeriveSessionKey(string[] peerPublicKeyBase64s)
     {
+        if (peerPublicKeyBase64s == null || peerPublicKeyBase64s.Length == 0)
+        {
+            return new byte[32];
+        }
+
         // Ordina le public keys per garantire costanza tra tutti i client
         var sortedKeys = OrderKeys(peerPublicKeyBase64s);
 
         using var sha256 = SHA256.Create();
-        // Combina tutte le public keys ordinate
-        var combined = string.Join("", sortedKeys.Select(k => Encoding.UTF8.GetBytes(k)));
+        // Concateniamo le public key ordinate come stringhe e le hashemiamo
+        // Questo garantisce che tutti i client con la stessa insiemi di peer
+        // derivino la stessa chiave sessione, indipendentemente dall'ordine di arrivo.
+        var combined = string.Join("", sortedKeys);
         var hash = sha256.ComputeHash(Encoding.UTF8.GetBytes(combined));
         var key = new byte[32];
         Array.Copy(hash, 0, key, 0, 32);

@@ -3,6 +3,7 @@ using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using BastionNet.Shared;
@@ -15,7 +16,7 @@ namespace BastionNet.Server;
 public class RelayServer
 {
     private readonly TcpListener _listener;
-    private readonly ConcurrentBag<ClientHandler> _clients = new();
+    private readonly ConcurrentDictionary<Guid, ClientHandler> _clients = new();
     private readonly CancellationTokenSource _cts = new();
 
     /// <summary>
@@ -58,7 +59,7 @@ public class RelayServer
         {
             var client = await _listener.AcceptTcpClientAsync();
             var handler = new ClientHandler(this, client);
-            _clients.Add(handler);
+            _clients.TryAdd(handler.Id, handler);
 
             _ = Task.Run(handler.HandleAsync);
             handler.MessageBroadcast += OnMessageBroadcast;
@@ -73,7 +74,7 @@ public class RelayServer
     public async Task StopAsync()
     {
         _cts.Cancel();
-        foreach (var client in _clients)
+        foreach (var client in _clients.Values)
         {
             try { client.TcpClient.Close(); } catch { }
         }
@@ -84,10 +85,11 @@ public class RelayServer
 
     /// <summary>
     /// Gestione disconnessione client segnalata dal ClientHandler.
+    /// Rimuove il client specifico dalla dictionary invece di usare TryTake arbitrario.
     /// </summary>
     internal void HandleClientDisconnected(ClientHandler client)
     {
-        _clients.TryTake(out _);
+        _clients.TryRemove(client.Id, out _);
         ClientDisconnected?.Invoke(client);
         Console.WriteLine($"[Server] Client disconnesso. Rimanenti: {_clients.Count}");
     }
@@ -99,11 +101,31 @@ public class RelayServer
     /// <param name="senderId">ID del mittente da escludere.</param>
     internal void Broadcast(string message, Guid senderId)
     {
-        foreach (var client in _clients)
+        foreach (var client in _clients.Values)
         {
             if (client.Id == senderId) continue;
-            _ = client.SendAsync(message);
+            try
+            {
+                client.SendAsync(message).GetAwaiter().GetResult();
+            }
+            catch (Exception ex)
+            {
+                // Log error but continue broadcasting to other clients
+                Console.WriteLine($"[Server] Errore broadcast a client {client.Id}: {ex.Message}");
+            }
         }
+    }
+
+    /// <summary>
+    /// Invia la public key di un peer a tutti i client eccetto il mittente.
+    /// Usato per lo key exchange: ogni client raccoglie le public key dei peer
+    /// per derivare la stessa chiave sessione condivisa.
+    /// </summary>
+    internal void BroadcastPeerPublicKey(string peerPublicKey, Guid senderId)
+    {
+        var message = new KeyExchangeMessage { PublicKey = peerPublicKey };
+        var json = JsonSerializer.Serialize(message);
+        Broadcast(json, senderId);
     }
 
     private void OnMessageBroadcast(ClientHandler sender, string message)

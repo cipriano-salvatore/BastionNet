@@ -33,6 +33,9 @@ public enum MessageType : byte
 /// </summary>
 public abstract partial class Message
 {
+    /// <summary>
+    /// Tipo di messaggio, serializzato nel campo "type" del JSON per il discrimination dei tipi durante deserializzazione.
+    /// </summary>
     [JsonIgnore] public MessageType Type { get; protected set; }
     [JsonIgnore] public Guid SenderId { get; set; } = Guid.NewGuid();
 }

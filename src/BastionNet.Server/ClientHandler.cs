@@ -20,6 +20,7 @@ public class ClientHandler
     private readonly RelayServer? _server;
     private readonly CancellationTokenSource _cts;
     private bool _disposed;
+    private readonly object _streamLock = new(); // Lock per scritture thread-safe sul stream
 
     /// <summary>
     /// Evento: messaggio ricevuto da questo client (da broadcastare).
@@ -33,8 +34,10 @@ public class ClientHandler
 
     // Per ECDH e chiave sessione
     private string _ownPrivateKeyBase64 = string.Empty;
+    private string _ownPublicKeyBase64 = string.Empty;
     private readonly List<string> _peerPublicKeys = new(); // Raccolta ordinata delle public key dei peer
     private bool _sessionKeyDerived = false;
+    private byte[] _sessionKey = Array.Empty<byte>();
 
     /// <summary>
     /// Costruttore principale: usato dal server.
@@ -74,7 +77,26 @@ public class ClientHandler
 
                 var json = Encoding.UTF8.GetString(buffer, 0, bytesRead);
                 // Deserializza il messaggio
-                var msg = JsonSerializer.Deserialize<Message>(json);
+                Message? msg;
+                try
+                {
+                    using var doc = JsonDocument.Parse(json);
+                    var root = doc.RootElement;
+
+                    // Determina il tipo di messaggio in base alla presenza di campi caratteristici
+                    if (root.TryGetProperty("publicKey", out var _))
+                        msg = JsonSerializer.Deserialize<KeyExchangeMessage>(json);
+                    else if (root.TryGetProperty("iv", out var _) || root.TryGetProperty("ciphertext", out var _))
+                        msg = JsonSerializer.Deserialize<EncryptedMessage>(json);
+                    else if (root.TryGetProperty("clientName", out var _))
+                        msg = JsonSerializer.Deserialize<ConnectMessage>(json);
+                    else
+                        msg = JsonSerializer.Deserialize<DisconnectMessage>(json);
+                }
+                catch
+                {
+                    continue;
+                }
 
                 if (msg == null) continue;
 
@@ -115,19 +137,34 @@ public class ClientHandler
 
     /// <summary>
     /// Gestisce lo scambio chiavi ECDH e deriva la chiave sessione condivisa.
+    /// Inoltra la public key del peer agli altri client affinché possano derivare la stessa chiave sessione.
     /// </summary>
     private void HandleKeyExchange(KeyExchangeMessage keMsg)
     {
+        // Memorizza la propria public key alla prima ricezione (se non già impostata)
+        if (string.IsNullOrEmpty(_ownPublicKeyBase64))
+        {
+            _ownPublicKeyBase64 = keMsg.PublicKey;
+        }
+
         var peerPublicKey = keMsg.PublicKey;
+
+        // Aggiunge la propria public key alla raccolta (se non esiste già)
+        if (!_peerPublicKeys.Contains(_ownPublicKeyBase64))
+        {
+            _peerPublicKeys.Add(_ownPublicKeyBase64);
+        }
 
         // Aggiunge la public key del peer alla raccolta (se non esiste già)
         if (!_peerPublicKeys.Contains(peerPublicKey))
         {
             _peerPublicKeys.Add(peerPublicKey);
-            Console.WriteLine($"[Client {Id}] Ricevuta public key dal peer. Totale peer: {_peerPublicKeys.Count}");
         }
 
-        // Deriva la chiave sessione se abbiamo abbastanza key e non l'abbiamo ancora fatta
+        // Inoltra le public key agli altri client perché possano derivare la stessa chiave sessione
+        _server?.BroadcastPeerPublicKey(peerPublicKey, Id);
+
+        // Deriva la chiave sessione se abbiamo almeno due key (propria + peer) e non l'abbiamo ancora fatta
         if (_peerPublicKeys.Count >= 2 && !_sessionKeyDerived)
         {
             DeriveSessionKey();
@@ -142,9 +179,7 @@ public class ClientHandler
     {
         try
         {
-            var sessionKey = Crypto.DeriveSessionKey(_peerPublicKeys.ToArray());
-            // Salvataggio della session key per uso futuro nei messaggi
-            // (In una implementazione completa, potresti volerla memorizzare in modo sicuro)
+            _sessionKey = Crypto.DeriveSessionKey(_peerPublicKeys.ToArray());
             _sessionKeyDerived = true;
             Console.WriteLine($"[Client {Id}] Chiave sessione condivisa derivata da {_peerPublicKeys.Count} peer(s)");
         }
@@ -171,10 +206,9 @@ public class ClientHandler
         try
         {
             // Decifra usando la chiave sessione condivisa
-            if (_sessionKeyDerived)
+            if (_sessionKeyDerived && _sessionKey != null && _sessionKey.Length > 0)
             {
-                plaintext = Crypto.DecryptWithSessionKey(encryptedMsg.Iv, encryptedMsg.Tag, encryptedMsg.Ciphertext, /* session key */ Array.Empty<byte>());
-                // Nota: La funzione sopra richiede una chiave di 32 byte, dobbiamo recuperarla
+                plaintext = Crypto.DecryptWithSessionKey(encryptedMsg.Iv, encryptedMsg.Tag, encryptedMsg.Ciphertext, _sessionKey);
             }
         }
         catch (CryptographicException)
@@ -208,8 +242,11 @@ public class ClientHandler
     {
         if (TcpClient?.Client?.Connected == true)
         {
-            var data = Encoding.UTF8.GetBytes(message);
-            await Stream.WriteAsync(data, 0, data.Length);
+            lock (_streamLock)
+            {
+                var data = Encoding.UTF8.GetBytes(message);
+                Stream.Write(data, 0, data.Length);
+            }
         }
     }
 
@@ -222,7 +259,7 @@ public class ClientHandler
         if (!_sessionKeyDerived) return;
 
         // Deriva la chiave sessione (già derivata da DeriveSessionKey)
-        // In una implementazione completa, passarremmo la sessionKey come parametro o la manterremmo in stato
+        // In una implementazione completa, passerremmo la sessionKey come parametro o la manterremmo in stato
         // Per semplicità, deriviamo nuovamente qui (deve dare lo stesso risultato)
         var sessionKey = Crypto.DeriveSessionKey(_peerPublicKeys.ToArray());
 
